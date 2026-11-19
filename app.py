@@ -6863,6 +6863,109 @@ _rerender_locks: Dict[str, asyncio.Lock] = {}
 _scenes_locks: Dict[str, asyncio.Lock] = {}
 
 
+@app.post("/api/clip/media")
+async def add_clip_media(
+    request: Request, job_id: str = Form(...), clip_index: int = Form(...),
+    input_filename: str = Form(...), music_volume: float = Form(.2),
+    original_volume: float = Form(1), music_mode: str = Form('none'),
+    watermark_mode: str = Form('none'), picture_mode: str = Form('none'),
+    watermark_query: str = Form(''), picture_query: str = Form(''),
+    pixabay_key: str = Form(''), music: Optional[UploadFile] = File(None),
+    blurred_vertical: bool = Form(False),
+    watermark: Optional[UploadFile] = File(None), picture: Optional[UploadFile] = File(None),
+):
+    import tempfile
+    import media_effects
+    await require_managed_entitlement(request)
+    await _ensure_job_files(job_id, request)
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, 'Job not found')
+    await _assert_job_owner(request, job)
+    if not (0 <= music_volume <= 2 and 0 <= original_volume <= 2):
+        raise HTTPException(400, 'Volumes must be between 0 and 2')
+    if input_filename != os.path.basename(input_filename) or not input_filename.endswith('.mp4'):
+        raise HTTPException(400, 'Invalid input filename')
+    async with _rerender_locks.setdefault(job_id, asyncio.Lock()):
+        directory = os.path.join(OUTPUT_DIR, job_id)
+        metadata = glob.glob(os.path.join(directory, '*_metadata.json'))
+        if not metadata:
+            raise HTTPException(404, 'Metadata not found')
+        with open(metadata[0]) as handle:
+            data = json.load(handle)
+        clips = data.get('shorts', [])
+        if not 0 <= clip_index < len(clips):
+            raise HTTPException(404, 'Clip not found')
+        # Like the other clip-edit endpoints, honor the editor's explicit
+        # input file. Its edit chain can legitimately differ from metadata
+        # (for example after a subtitle/hook edit or restoring editor state).
+        # A different filename alone does not mean the input is stale.
+        try:
+            source = media_effects.resolve_source(directory, input_filename)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(404, 'This video file is no longer available. Reload the job and try again.') from exc
+        clean_name = await asyncio.to_thread(_strip_burned_captions, directory, input_filename)
+        restore_captions = bool(re.search(r'(^|_)subtitled_\d+_', input_filename))
+        if restore_captions:
+            if clean_name == input_filename:
+                raise HTTPException(400, 'The video without subtitles is unavailable. Restore the source before placing images behind subtitles.')
+            source = media_effects.resolve_source(directory, clean_name)
+        output_name = f'media_{uuid.uuid4().hex}.mp4'
+        output = os.path.join(directory, output_name)
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                assets = {}
+                for kind, mode, upload, query in [
+                    ('music', music_mode, music, ''),
+                    ('watermark', watermark_mode, watermark, watermark_query),
+                    ('picture', picture_mode, picture, picture_query),
+                ]:
+                    if mode not in ('none', 'upload', 'api'):
+                        raise ValueError('Invalid asset source')
+                    if mode == 'none':
+                        continue
+                    path = os.path.join(temp, kind + ('.audio' if kind == 'music' else '.png'))
+                    if mode == 'upload':
+                        if upload is None:
+                            raise ValueError(f'Choose a {kind} file')
+                        size = 0
+                        with open(path, 'wb') as target:
+                            while chunk := await upload.read(65536):
+                                size += len(chunk)
+                                if size > media_effects.LIMIT:
+                                    raise ValueError('Asset exceeds 30 MB')
+                                target.write(chunk)
+                    else:
+                        url = await asyncio.to_thread(media_effects.random_asset, kind, query, pixabay_key)
+                        await asyncio.to_thread(media_effects.download, url, path)
+                    assets[kind] = path
+                await asyncio.to_thread(media_effects.render, source, output, **assets,
+                                        music_volume=music_volume, original_volume=original_volume,
+                                        blurred_vertical=blurred_vertical)
+            # Compose images first, then captions at the final frame size.
+            # Starting from the uncaptioned input avoids duplicate text and
+            # keeps captions sharp when the vertical framing changes.
+            if restore_captions:
+                captioned = await asyncio.to_thread(_reapply_captions, job_id, clip_index, output)
+                if not captioned:
+                    raise ValueError('Could not restore subtitles over the images')
+                output_name = os.path.basename(captioned)
+            output_name = await _deliver(request, job_id, output_name)
+        except Exception as exc:
+            if os.path.exists(output):
+                os.remove(output)
+            detail = str(exc) if isinstance(exc, ValueError) else 'Could not apply media. Check files and API settings.'
+            raise HTTPException(400, detail) from exc
+        url = f'/videos/{job_id}/{output_name}'
+        clips[clip_index]['video_url'] = url
+        write_json_atomic(metadata[0], data, indent=4)
+        job['result']['clips'][clip_index]['video_url'] = url
+        _archive_clip_edit_bg(job_id, clip_index, output_name)
+        return {'new_video_url': url}
+
+
 @app.post("/api/clip/rerender")
 async def rerender_clip(req: RerenderRequest, request: Request):
     """Re-render a clip from an edited EDL (the clip editor's save button).
