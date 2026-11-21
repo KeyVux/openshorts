@@ -85,6 +85,12 @@ MAX_WAIT = _float_env("YT_ACCOUNT_MAX_WAIT", 90)
 REST_SECONDS = _float_env("YT_ACCOUNT_REST_SECONDS", 900)
 REST_STRIKES = _int_env("YT_ACCOUNT_REST_STRIKES", 3)
 MAX_ACCOUNTS = 9
+# With every account resting, how long a download waits for the first one to
+# wake before it goes ahead with a resting one (0: at once, as it used to).
+# Asking a limited account again gets the same answer and counts against it:
+# a queue of downloads doing that kept every account limited for as long as
+# there were downloads to try.
+REST_WAIT = _float_env("YT_ACCOUNT_REST_WAIT", 600)
 
 _COOLDOWN_FILE = ".yt-account.cooldown"
 _REST_FILE = ".yt-account-rest-{}"
@@ -99,6 +105,19 @@ def is_rate_limit(text) -> bool:
     """Whether an error text is YouTube limiting the account (not the video)."""
     t = str(text or "").lower()
     return any(m in t for m in _MARKERS)
+
+
+# An age-restricted video, refused to the account that asked (signed in but
+# not age-verified: "Sorry, this content is age-restricted ... provide more
+# info so we can be sure you're an adult") or to nobody signed in ("Sign in to
+# confirm your age"). Other accounts may be verified: the video moves on.
+_AGE_MARKERS = ("age-restricted", "confirm your age", "inappropriate for some users")
+
+
+def is_age_gate(text) -> bool:
+    """Whether an error text is YouTube refusing an age-restricted video."""
+    t = str(text or "").lower()
+    return any(m in t for m in _AGE_MARKERS)
 
 
 def state_dir():
@@ -385,6 +404,50 @@ def _turn():
         os.close(fd)
 
 
+def all_resting(count=None, now=None) -> float:
+    """Seconds until the first account wakes when every one of them rests, 0
+    when at least one is awake (or there is none, or a single one: it never
+    rests)."""
+    count = len(accounts()) if count is None else count
+    if count < 2:
+        return 0.0
+    left = [resting(i, now) for i in range(count)]
+    return min(left) if all(x > 0 for x in left) else 0.0
+
+
+def wait_for_awake(max_wait=None, sleep=time.sleep, say=None) -> float:
+    """Block while every account rests, until one wakes or ``max_wait``
+    (``REST_WAIT``) seconds went by. Returns the seconds waited. For a job's
+    download, never for a request somebody is waiting on."""
+    max_wait = REST_WAIT if max_wait is None else max_wait
+    waited = 0.0
+    told = False
+    while waited < max_wait:
+        left = all_resting()
+        if left <= 0:
+            break
+        if say and not told:
+            say(left)
+            told = True
+        step = min(left + 1.0, 15.0, max_wait - waited)
+        sleep(step)
+        waited += step
+    return waited
+
+
+def home_exit(account, exits) -> int:
+    """Which of ``exits`` (the free routes, in the order they are configured)
+    this account's requests leave through: always the same one. A signed-in
+    session that shows up from a different address every few seconds does not
+    look like a person, and the accounts were limited far below the request
+    rate YouTube lets one through; with more accounts than exits they share,
+    which is what people behind one address do. 0 with nothing to choose."""
+    exits = int(exits or 0)
+    if exits <= 0 or account is None:
+        return 0
+    return int(account) % exits
+
+
 def pick(exclude=(), awake_only=False, count=None, now=None):
     """Which account the next video uses: the next in turn among those not
     resting. With all of them resting, the one closest to waking (or None
@@ -474,6 +537,17 @@ class Session:
             return True
         self.answers += 1
         return False
+
+    def age_gated(self) -> bool:
+        """YouTube refused this video to this account for its age (the
+        account is not age-verified). True when the video moved to an account
+        it has not tried yet, preferring one that is not resting. Not a strike
+        against the account: it is fine for every other video."""
+        n = len(self._texts)
+        nxt = pick(exclude=self._tried, awake_only=True, count=n)
+        if nxt is None:
+            nxt = pick(exclude=self._tried, awake_only=False, count=n)
+        return self._use(nxt)
 
     def close(self):
         path, self.path = self.path, None

@@ -99,7 +99,7 @@ _CONTENT_HINTS = (
     "join this channel", "not available on this app", "is not a valid url",
     "unsupported url", "no video formats found", "premieres in", "will begin in",
     "this live event", "no duration in metadata", "requested format is not available",
-    "account has been terminated", "video is age", "confirm your age",
+    "account has been terminated", "video is age", "confirm your age", "age-restricted",
     # An uploader's country block: the residential pool exits from the same
     # blocked countries, so the paid probe failed with the identical error in
     # 5 of the 6 cases between 3-sep and 5-sep-2026 (3.6 MB each, and the
@@ -200,6 +200,17 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     if reason:
         raise NotASingleVideo(f"This link is {reason}.")
 
+    # A YouTube video probed in the last hours (the download cache keeps its
+    # length): a video's length does not change, and asking again would spend
+    # a request of a YouTube account for an answer we already have.
+    import source_cache
+    known = source_cache.probe_get(url)
+    if known:
+        if known.get("max_height"):
+            _probe_facts[url] = {"at": time.time(), "max_height": int(known["max_height"]),
+                                 "duration": int(known["seconds"])}
+        return known["seconds"] / 60.0
+
     bgutil_http = os.environ.get("BGUTIL_BASE_URL", "").strip()
     bgutil_script = os.environ.get("BGUTIL_SCRIPT_PATH", "").strip()
     # Same client lists as the download (yt_clients.py): the authed defaults
@@ -221,12 +232,8 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     strategies = ([(hd_args, True)] if hd_args else []) + [
         (fallback_extractor_args(bgutil_http, bgutil_script), not hd_args)]
 
-    # Rotated per probe to spread load across the pool, like the download does.
     statics = [p.strip() for p in
                os.environ.get("STATIC_PROXY_URLS", "").split(",") if p.strip()]
-    if statics:
-        k = random.randrange(len(statics))
-        statics = statics[k:] + statics[:k]
     paid = os.environ.get("PROXY_URL", "").strip()
     if not allow_paid:
         paid = ""  # daily budget hit (cloud/proxy_ledger.budget_exceeded)
@@ -235,11 +242,6 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     # Rumble, product pages and drive links were all reaching it here.
     if not is_youtube_url(url):
         paid = ""
-    proxies = plan_probe_proxies(
-        os.environ.get("DIRECT_FIRST", "").strip() == "1",
-        statics,
-        paid,
-    )
     static_errors: dict = {}
 
     # Same cookies + PO token the download uses: an anonymous probe gets
@@ -249,10 +251,22 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     # One of the configured accounts (yt_account.Session), as a private file.
     session = yt_account.Session()
     try:
-        return _probe_with_proxies(url, proxies, strategies, static_errors,
-                                   paid, session.path)
+        # The account's own exit first (yt_account.home_exit), like the
+        # download: an account leaves through the same address every time.
+        # With no account, any of them, to spread the load.
+        if statics:
+            k = (yt_account.home_exit(session.account, len(statics)) if session.path
+                 else random.randrange(len(statics)))
+            statics = statics[k:] + statics[:k]
+        proxies = plan_probe_proxies(
+            os.environ.get("DIRECT_FIRST", "").strip() == "1", statics, paid)
+        minutes = _probe_with_proxies(url, proxies, strategies, static_errors,
+                                      paid, session.path)
     finally:
         session.close()
+    facts = _probe_facts.get(url) or {}
+    source_cache.probe_put(url, minutes * 60.0, facts.get("max_height"))
+    return minutes
 
 
 # --- The probe in its own process -------------------------------------------
@@ -345,6 +359,34 @@ async def run_probe(url: str, allow_paid: bool = True) -> float:
 # submission. Small and short-lived: one entry per recent submission.
 _PROBE_FACTS_TTL = 600
 _probe_facts: dict = {}
+
+
+def _keep_extraction(url, info, proxy, authed, extractor_args):
+    """Leave what YouTube just answered for the download that follows this
+    probe (``source_cache.info_put``): it then asks nothing of the account.
+    Best effort, and never from the per-GB proxy: its exit address changes
+    between requests, and media links only work from the one that asked."""
+    try:
+        import source_cache
+        import yt_dlp
+        if not source_cache.info_enabled() or not is_youtube_url(url):
+            return
+        clean = yt_dlp.YoutubeDL.sanitize_info(info, remove_private_keys=True)
+        # The sanitizer drops every "__" key, and one of them is how yt-dlp
+        # knows a format has to be tested before it is picked (the HLS
+        # formats of a recent upload): without it the download would take
+        # such a format untested where a fresh extraction rejects it.
+        untested = {f.get("format_id") for f in (info.get("formats") or [])
+                    if isinstance(f, dict) and f.get("__needs_testing")}
+        for f in clean.get("formats") or []:
+            if f.get("format_id") in untested:
+                f["__needs_testing"] = True
+        # Most of the result's size, and nothing a download reads.
+        for key in ("automatic_captions", "subtitles", "thumbnails", "heatmap"):
+            clean.pop(key, None)
+        source_cache.info_put(url, clean, proxy, authed, extractor_args)
+    except Exception:
+        pass
 
 
 def _remember_probe(url, info):
@@ -447,6 +489,8 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
                 duration = info.get("duration")
                 if duration:
                     _remember_probe(url, info)
+                    if not is_paid:
+                        _keep_extraction(url, info, proxy, authed, extractor_args)
                     if is_paid:
                         _paid_probe_events.append({
                             "url": url, "static_errors": dict(static_errors),
@@ -465,6 +509,8 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
                 route_errors.append(str(e)[:300])
                 if authed and yt_account.is_rate_limit(str(e)):
                     session.limited()   # moves to another account if one is awake
+                elif authed and yt_account.is_age_gate(str(e)):
+                    session.age_gated()  # an age-verified account may open it
         else:
             if not is_paid:
                 static_errors[_route_name(proxy, proxies)] = (
@@ -860,16 +906,42 @@ async def free_actions_today(user_id, job_type: str) -> int:
         )).scalar_one() or 0)
 
 
+async def free_actions_total(user_id, job_type: str) -> int:
+    """How many zero-minute ``job_type`` rows this user has, ever."""
+    async with database.session() as session:
+        return int((await session.execute(
+            select(func.count(UsageLedger.id)).where(and_(
+                UsageLedger.user_id == user_id,
+                UsageLedger.job_type == job_type,
+                UsageLedger.minutes == 0,
+            ))
+        )).scalar_one() or 0)
+
+
 async def record_free_action(user_id, job_id: str, job_type: str):
-    """A committed zero-minute row: counts a free daily allowance (AI edits)
-    across restarts without touching the balance."""
+    """A committed zero-minute row: counts a free allowance (AI edits per day,
+    social posts in total) across restarts without touching the balance.
+    Returns the row id, for undo_free_action."""
+    row = UsageLedger(
+        user_id=user_id, job_id=str(job_id), job_type=job_type,
+        minutes=_D(0), minutes_from_plan=_D(0), minutes_from_topup=_D(0),
+        status="committed",
+    )
     async with database.session() as session:
         async with session.begin():
-            session.add(UsageLedger(
-                user_id=user_id, job_id=str(job_id), job_type=job_type,
-                minutes=_D(0), minutes_from_plan=_D(0), minutes_from_topup=_D(0),
-                status="committed",
-            ))
+            session.add(row)
+    return str(row.id)
+
+
+async def undo_free_action(ledger_id):
+    """Give back a free action whose work failed (zero-minute rows only)."""
+    if not ledger_id:
+        return
+    async with database.session() as session:
+        async with session.begin():
+            row = await session.get(UsageLedger, ledger_id)
+            if row is not None and row.minutes == 0 and row.status == "committed":
+                await session.delete(row)
 
 
 async def commit_reservation(ledger_id: str):

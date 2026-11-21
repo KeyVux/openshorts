@@ -34,6 +34,7 @@ import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
+                            detail_plan, vision_targets,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
@@ -853,6 +854,10 @@ def cap_source_duration(input_video, max_minutes, safety=False, start_seconds=0.
     raise RuntimeError(f"could not cut the source to its first {float(max_minutes):g} minutes")
 
 
+AGE_RESTRICTED_MESSAGE = ("This video is age-restricted on YouTube and could not be "
+                          "opened. Download it and upload the file instead.")
+
+
 def _content_block(error_text):
     """User-facing reason when the VIDEO (not the network) can't be fetched."""
     t = error_text.lower()
@@ -865,18 +870,88 @@ def _content_block(error_text):
 
 
 def download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
-                           cap_minutes=None, route_out=None):
+                           cap_minutes=None, route_out=None, use_cache=False):
     """Download ``url`` with only public addresses resolvable (ssrf_guard): the
     checked URL is not the only one yt-dlp talks to (redirects, URLs read out
     of an extracted page, a DNS answer that changes after the check)."""
     import ssrf_guard
-    with ssrf_guard.guarded():
-        return _download_youtube_video(url, output_dir, on_audio=on_audio, allow_paid=allow_paid,
-                                       cap_minutes=cap_minutes, route_out=route_out)
+    import source_cache
+    # A YouTube video another job downloaded whole in the last hours is taken
+    # from the download cache: no YouTube request, no account spent
+    # (source_cache.py). Only for a job process (``use_cache``): a miss can
+    # wait minutes for another job's download of the same video, which an
+    # in-process caller on a shared executor must not; nor with a cap, which
+    # expects the fetch itself to stop there.
+    cacheable = (use_cache and cap_minutes is None and source_cache.enabled()
+                 and bool(source_cache.video_id(url)))
+    if not cacheable:
+        with ssrf_guard.guarded():
+            return _download_youtube_video(url, output_dir, on_audio=on_audio,
+                                           allow_paid=allow_paid, cap_minutes=cap_minutes,
+                                           route_out=route_out, may_wait=use_cache)
+    hit = source_cache.fetch(url, output_dir)
+    if hit is None:
+        with source_cache.claim(url):
+            # The job we waited for may have just stored it.
+            hit = source_cache.fetch(url, output_dir)
+            if hit is None:
+                route = route_out if isinstance(route_out, dict) else {}
+                with ssrf_guard.guarded():
+                    path, title = _download_youtube_video(
+                        url, output_dir, on_audio=on_audio, allow_paid=allow_paid,
+                        cap_minutes=cap_minutes, route_out=route, may_wait=True)
+                if source_cache.is_whole_free_download(route):
+                    source_cache.store(url, path, title)
+                return path, title
+    route = {"winner": "cache", "paid_bytes": 0, "attempts": []}
+    if isinstance(route_out, dict):
+        route_out.update(route)
+    print("PROXY_ROUTE=" + json.dumps(route, ensure_ascii=False))
+    return hit
+
+
+
+def _stored_extraction(url, attempts, paid_proxy, need_seconds=0):
+    """``(label, extractor args, format, proxy, cookies, info)``: the attempt
+    that can download from the extraction this video's probe kept
+    (``source_cache.info_get``), or None.
+
+    The same exit as the probe (media links are bound to the address that
+    asked for them), the same client list, and never the per-GB proxy.
+    ``need_seconds``: how long the links must still live past the usual
+    margin (the length of a ranged fetch). The attempt comes back without the
+    cookies: nothing in it is a request of the account. What
+    comes back is yt-dlp's own result, written by this host's probe into a
+    dot directory nothing else writes."""
+    try:
+        import source_cache
+        if not is_youtube_url(url):
+            return None
+        kept = source_cache.info_get(url, need_seconds=need_seconds)
+        if not kept:
+            return None
+        want = json.dumps(kept.get("args"), sort_keys=True)
+        for label, ea, fmt, proxy, cookies in attempts:
+            if paid_proxy and proxy == paid_proxy:
+                continue
+            if (source_cache.route_key(proxy) == kept["route"]
+                    and json.dumps(ea, sort_keys=True) == want):
+                return label, ea, fmt, proxy, False, kept["info"]
+    except Exception:
+        pass
+    return None
+
+
+def _forget_extraction(url):
+    try:
+        import source_cache
+        source_cache.info_drop(url)
+    except Exception:
+        pass
 
 
 def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
-                            cap_minutes=None, route_out=None):
+                            cap_minutes=None, route_out=None, may_wait=False):
     """
     Downloads a YouTube video using yt-dlp.
     Returns the path to the downloaded video and the video title.
@@ -913,6 +988,13 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     # The account this video uses (one of YOUTUBE_COOKIES, YOUTUBE_COOKIES_2,
     # ...), as a private cookie file. Never print its CONTENT: it is a live
     # YouTube session.
+    # With every account resting, a job's download waits for one to wake
+    # instead of asking a limited one again (yt_account.REST_WAIT). Not a
+    # download that runs inside the API (``may_wait`` False): its caller is
+    # somebody waiting on a request.
+    if may_wait and is_youtube_url(url):
+        yt_account.wait_for_awake(say=lambda left: print(
+            f"⏳ Every YouTube account is resting: waiting up to {left / 60:.0f} min for one."))
     yt_session = yt_account.Session()
     cookies_path = yt_session.path
     if cookies_path:
@@ -936,8 +1018,13 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     _statics = [p.strip() for p in
                 os.environ.get("STATIC_PROXY_URLS", "").split(",") if p.strip()]
     if _statics:
-        import random as _random
-        k = _random.randrange(len(_statics))
+        # The account's own exit first (yt_account.home_exit): each account
+        # leaves through the same address every time. With no account, any.
+        if cookies_path:
+            k = yt_account.home_exit(yt_session.account, len(_statics))
+        else:
+            import random as _random
+            k = _random.randrange(len(_statics))
         _statics = _statics[k:] + _statics[:k]
         print(f"🌐 {len(_statics)} static ISP proxies configured.")
 
@@ -1060,7 +1147,7 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             print(f"   ℹ️ Early audio skipped ({type(e).__name__}: {e}) — "
                   f"transcribing once the video is in.")
 
-    def _attempt(extractor_args, fmt, proxy, cookies=True):
+    def _attempt(extractor_args, fmt, proxy, cookies=True, info=None):
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
         # Extracted ONCE, unprocessed, and handed to the download below: a
@@ -1069,9 +1156,12 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         # An extraction that sends the account's cookies takes one of the
         # account's slots and keeps its distance from the previous one
         # (yt_account): the account's request budget is shared by every job.
-        with (yt_session.request() if (cookies and cookies_path) else contextlib.nullcontext()):
-            with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
-                info = ydl.extract_info(url, download=False, process=False)
+        # ``info``: the extraction the probe of this video left behind
+        # (_stored_extraction): nothing is asked of YouTube but the media.
+        if info is None:
+            with (yt_session.request() if (cookies and cookies_path) else contextlib.nullcontext()):
+                with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
+                    info = ydl.extract_info(url, download=False, process=False)
         # Media URLs another program will fetch (ffmpeg on a ranged or HLS
         # download) resolve outside the Python guard: check them here. YouTube's
         # own CDN hosts are skipped (dozens of them, never internal).
@@ -1106,6 +1196,7 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             'merge_output_format': 'mp4', 'overwrites': True,
             'progress_hooks': [_progress_hook],
         }
+        _dl_bytes["ranged"] = ranged
         if ranged:
             from yt_dlp.utils import download_range_func
             dl_opts['download_ranges'] = download_range_func(None, [(0, _range_cap)])
@@ -1157,9 +1248,34 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     # below so app.py can keep a durable trail of WHY a job reached the paid
     # proxy (the container log rotates within the hour; see cloud/proxy_ledger).
     attempt_log = []
+    # The probe of this video asked YouTube the same question minutes ago and
+    # kept the answer (source_cache.info_put): downloading from it spends no
+    # request of a YouTube account. Only on the route that asked (media links
+    # are bound to its address) and with the same client list; when it does
+    # not work the attempts below run as if it had never been there.
+    stored = _stored_extraction(url, attempts, _proxy, need_seconds=_range_cap or 0)
+    if stored is not None:
+        label, ea, fmt, proxy, cookies, info = stored
+        try:
+            print(f"📥 Download attempt: {label} (extraction reused)")
+            sanitized_title = _attempt(ea, fmt, proxy, cookies, info=info)
+            attempt_log.append({"label": label, "ok": True, "paid": False, "reused": True,
+                                "bytes": _dl_bytes["total"] + _dl_bytes["partial"]})
+            print(f"✅ Download succeeded ({label}).")
+        except Exception as e:
+            _forget_extraction(url)
+            attempt_log.append({"label": label, "ok": False, "paid": False, "reused": True,
+                                "bytes": _dl_bytes["total"] + _dl_bytes["partial"],
+                                "error": str(e)[:300]})
+            print(f"⚠️  The reused extraction did not download ({str(e)[:160]}): asking YouTube again.")
+            sanitized_title = None
     account_limited = False
+    # Age-restricted: every account tried said no (or nobody is signed in).
+    age_refused = False
     skip_told = False
     for label, ea, fmt, proxy, cookies in attempts:
+        if sanitized_title is not None:
+            break                 # the reused extraction already has the file
         if cookies and cookies_path and yt_session.spent:
             # YouTube said twice for this video (or, during a cooldown, to
             # everybody) that the account is limited: one more request with
@@ -1206,6 +1322,17 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
                         print(f"🔁 Moving this video to YouTube account "
                               f"{yt_session.account + 1}.")
                     break       # not again on this route; the next one may differ
+                if yt_account.is_age_gate(str(e)):
+                    # Age-restricted, and this account is not age-verified
+                    # (or nobody is signed in). Another account may be: the
+                    # next route uses it. With none left, no other route or
+                    # proxy can help: the video is the problem.
+                    if cookies and cookies_path and yt_session.age_gated():
+                        print(f"🔞 Age-restricted video: moving it to YouTube account "
+                              f"{yt_session.account + 1}.")
+                    else:
+                        age_refused = True
+                    break
                 retryable = '403' in str(e) or 'Forbidden' in str(e)
                 if not retryable or retry == 1:
                     break
@@ -1216,6 +1343,8 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         # cannot change that, so stop instead of spending every attempt.
         if last_err is not None and _content_block(str(last_err)):
             break
+        if age_refused:
+            break
 
     if sanitized_title is None and isinstance(route_out, dict):
         # A failed download still paid for its proxied attempts.
@@ -1224,6 +1353,12 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
 
     if sanitized_title is None and last_err is not None and _content_block(str(last_err)):
         print(f"❌ {_content_block(str(last_err))}")
+        raise last_err
+
+    if sanitized_title is None and age_refused and not account_limited:
+        # Not while an account was only rate-limited: that one may be
+        # age-verified, and the job is retried after the cooldown below.
+        print(f"❌ {AGE_RESTRICTED_MESSAGE}")
         raise last_err
 
     if sanitized_title is None and account_limited:
@@ -1265,6 +1400,8 @@ Technical Details: {str(last_err)}
         "winner": attempt_log[-1]["label"] if attempt_log and attempt_log[-1].get("ok") else None,
         "paid_bytes": paid_bytes,
         "attempts": attempt_log,
+        # Only the paid minutes were fetched: not the whole source.
+        "ranged": bool(_dl_bytes.get("ranged")),
     }
     if isinstance(route_out, dict):
         route_out.update(route)
@@ -1296,7 +1433,7 @@ def finalize_clip_passthrough(input_video, final_output_video):
 
 
 def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=None,
-                      plan_only=False, mark=False):
+                      plan_only=False, mark=False, style=None):
     """Burn the default caption style onto a finished clip.
 
     ``split_ranges``: (start, end) stretches, in clip seconds, rendered with
@@ -1329,7 +1466,9 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         return None  # silent video: nothing to caption
     try:
         import subtitles as _subs
-        style = _subs.AUTO_CAPTION_STYLE
+        # ``style``: a CAPTION_PRESETS entry to burn instead of the default
+        # look (pro mode's captions); what it does not name stays the default.
+        style = {**_subs.AUTO_CAPTION_STYLE, **(style or {})}
         output_dir = os.path.dirname(clip_path)
         stem = os.path.basename(clip_path)
         generation_id = int(time.time())
@@ -1370,7 +1509,8 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
                 font_name=style["font_name"], font_color=style["font_color"],
                 border_color=style["border_color"], border_width=style["border_width"],
                 highlight_color=style["highlight_color"], effect=style["effect"],
-                base_opacity=style["base_opacity"], uppercase=style["uppercase"]):
+                base_opacity=style["base_opacity"], uppercase=style["uppercase"],
+                shadow=style.get("shadow", 0), reveal=style.get("reveal", False)):
             print("   ℹ️ No words in range — clip ships without captions.")
             return None
 
@@ -1489,6 +1629,50 @@ def auto_hook_clip(clip_path, clip, captions=None, mark=False):
         print(f"   ⚠️ Auto-hook failed ({type(e).__name__}: {e}) — "
               f"delivering the clip without it.")
         return None
+
+
+def pro_clip(clip_path, clip, transcript):
+    """Pro mode for a freshly framed clip (pro_mode.py, PRO_MODE).
+
+    Always records whether the clip is the kind pro mode fits
+    (``clip['pro_suggested']``, a keyframe face check: the dashboard offers
+    the switch on those). With PRO_MODE=auto it also renders it, and returns
+    (pro clean path, clip-relative transcript, 0.0, duration) for the hook and
+    the captions to go on that file instead; None otherwise. A busy host or a
+    failed render ships the clip as it is: pro mode must never cost a clip."""
+    import pro_mode
+    if pro_mode.mode() == "off":
+        return None
+    clip['pro_suggested'] = pro_mode.suggested(clip_path, clip.get('layout_ranges'))
+    if pro_mode.mode() != "auto" or not clip['pro_suggested']:
+        return None
+    try:
+        wait = float(os.environ.get("PRO_JOB_WAIT_SECONDS", "120"))
+    except ValueError:
+        wait = 120.0
+    import subtitles as _subs
+    hook_seconds = 0.0
+    if os.environ.get("AUTO_HOOK") == "1" and (clip.get('viral_hook_text') or '').strip():
+        try:
+            hook_seconds = float(os.environ.get("AUTO_HOOK_SECONDS", "5"))
+        except ValueError:
+            hook_seconds = 5.0
+    try:
+        out_name, updates = pro_mode.convert(
+            clip_path, os.path.basename(clip_path), clip, transcript, wait=wait,
+            api_key=os.getenv("GEMINI_API_KEY"), hook_seconds=hook_seconds,
+            caption_style=_subs.CAPTION_PRESETS["cine"])
+    except Exception as e:
+        print(f"   ℹ️ Pro mode skipped ({type(e).__name__}: {e}) — clip ships as it is.")
+        return None
+    clip.update(updates)
+    import recut
+    segments = updates['recipe']['segments']
+    print(f"   ✨ Pro mode: {len(segments)} stretch(es), "
+          f"{recut.total_duration(segments):.1f}s")
+    return (os.path.join(os.path.dirname(clip_path), out_name),
+            recut.virtual_transcript(transcript, segments),
+            0.0, recut.total_duration(segments))
 
 
 def trim_subtitle_band(input_video, band):
@@ -1937,6 +2121,123 @@ def load_transcript_checkpoint(output_dir, input_video, duration):
         return None
 
 
+def prepare_transcript(input_video, output_dir, url, mode):
+    """``--prepare-only``: leave this source's transcript as the job's
+    checkpoint, so the run that renders it (a remote worker with no GPU, or
+    the retry on this host) reuses it instead of transcribing.
+
+    ``mode`` "cache": only what the download cache already holds for this very
+    source. "1": otherwise transcribe here, on this host's card, inside the
+    same host-wide slot as any job, and only if one frees up within
+    ``PREPARE_TRANSCRIPT_WAIT`` seconds (45): this host's own jobs need those
+    slots too, so when they are busy the renderer transcribes for itself.
+    Best effort: without a checkpoint the renderer transcribes as it always
+    did."""
+    try:
+        cap = cv2.VideoCapture(input_video)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        duration = frame_count / fps
+        if load_transcript_checkpoint(output_dir, input_video, duration) is not None:
+            return True
+        transcript, from_cache = None, False
+        if url:
+            import source_cache
+            transcript = source_cache.fetch_transcript(url, duration)
+            from_cache = transcript is not None
+        if transcript is None and mode == "1":
+            from transcribe_backends import NoAudioError, GpuUnavailable, require_gpu
+            # Here only on the card: on the CPU the renderer does it better.
+            require_gpu()
+            try:
+                wait = float(os.environ.get("PREPARE_TRANSCRIPT_WAIT", "") or 45)
+            except ValueError:
+                wait = 45.0
+            try:
+                transcript = transcribe_video(input_video, slot_timeout=max(0.0, wait))
+            except NoAudioError:
+                return False
+            except TimeoutError:
+                print("⏭️ No free transcription slot here: the renderer transcribes.")
+                return False
+            except GpuUnavailable as e:
+                print(f"⏭️ Not transcribing here off the GPU ({e}): the renderer transcribes.")
+                return False
+        if transcript is None or not transcript.get("segments"):
+            return False
+        save_transcript_checkpoint(output_dir, transcript, input_video, duration)
+        if url and not from_cache:
+            import source_cache
+            source_cache.store_transcript(url, duration, transcript, input_video)
+        return True
+    except Exception as e:
+        print(f"⚠️ Transcript not prepared ({type(e).__name__}: {e}).")
+        return False
+
+
+def prepare_scenes(input_video, output_dir):
+    """``--prepare-only``: TransNetV2 over the whole source, on this host's
+    card only and inside one of ``SCENE_HOST_SLOTS`` (2) host slots of its own
+    (``PREPARE_SCENES_WAIT`` seconds at most, 30), its per-frame probabilities left in the job directory for the
+    worker that renders the clips (scene_detection.use_prepared). Off the card,
+    without a slot or past ``PREPARE_SCENES_MAX_MINUTES`` (45) it does
+    nothing: the worker runs the network on each clip as it always did. Best
+    effort."""
+    try:
+        import torch
+        import scene_detection
+        if not torch.cuda.is_available():
+            return False
+        if os.environ.get("SCENE_ENGINE", "transnetv2").strip().lower() == "pyscenedetect":
+            return False
+        cap = cv2.VideoCapture(input_video)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        duration = frame_count / fps if fps else 0
+        try:
+            max_minutes = float(os.environ.get("PREPARE_SCENES_MAX_MINUTES", "") or 45)
+        except ValueError:
+            max_minutes = 45.0
+        if not duration or duration > max_minutes * 60:
+            return False
+        try:
+            wait = float(os.environ.get("PREPARE_SCENES_WAIT", "") or 30)
+        except ValueError:
+            wait = 30.0
+        from transcribe_backends import host_asr_slot, ASR_LOCK_DIR
+        try:
+            slots = int(os.environ.get("SCENE_HOST_SLOTS", "") or 2)
+        except ValueError:
+            slots = 2
+        t0 = time.time()
+        # Inside one of the host's scene slots, a pool of its own: twenty
+        # prepares each opening a CUDA context at once is what filled the card
+        # on 18-nov-2026, and sharing the transcription slots made the
+        # transcripts wait behind the scenes (19-nov-2026).
+        try:
+            with host_asr_slot(slots=max(1, slots), timeout=max(0.0, wait),
+                               lock_dir=os.path.join(ASR_LOCK_DIR, ".scene-gpu")):
+                probs, src_fps = scene_detection.source_probabilities(input_video)
+        except TimeoutError:
+            print("⏭️ No free GPU slot here: the worker detects the scenes itself.")
+            return False
+        if not len(probs) or len(probs) > scene_detection.MAX_PREPARED_FRAMES:
+            return False
+        payload = scene_detection.scenes_payload(input_video, duration, probs, src_fps)
+        tmp = os.path.join(output_dir, scene_detection.SCENES_CHECKPOINT + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, os.path.join(output_dir, scene_detection.SCENES_CHECKPOINT))
+        print(f"🎬 Scene probabilities prepared ({len(probs)} frames, "
+              f"{time.time() - t0:.1f}s).")
+        return True
+    except Exception as e:
+        print(f"⚠️ Scenes not prepared ({type(e).__name__}: {e}).")
+        return False
+
+
 def clear_transcript_checkpoint(output_dir):
     try:
         os.remove(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT))
@@ -1969,9 +2270,12 @@ def _free_gpu_cache():
         pass
 
 
-def transcribe_video(video_path):
+def transcribe_video(video_path, slot_timeout=None):
+    """``slot_timeout``: seconds to wait for a host transcription slot before
+    giving up with TimeoutError (None waits for as long as it takes)."""
     print("🎙️  Transcribing video...")
-    from transcribe_backends import transcribe_media, release_models, host_asr_slot
+    from transcribe_backends import (transcribe_media, release_models, host_asr_slot,
+                                     media_seconds)
 
     # At most ASR_HOST_SLOTS jobs transcribe on the GPU at once, host-wide.
     # Inside the slot, the model's VRAM is handed back before the long render
@@ -1980,7 +2284,10 @@ def transcribe_video(video_path):
     # clips into its render still held 5.9 GB of the 20 GB card; eight such
     # jobs filled it and NVENC / TransNetV2 failed with CUDA OOM (30-60% of
     # jobs failing per hour at peak). Nothing after this point transcribes.
-    with host_asr_slot():
+    # A long source never takes the last slot (ASR_LONG_SECONDS). Whisper
+    # keeps the slot even if it falls to the CPU: its CUDA context stays on
+    # the card until the process exits.
+    with host_asr_slot(timeout=slot_timeout, media_seconds=media_seconds(video_path)):
         try:
             transcript = transcribe_media(video_path)
         finally:
@@ -2195,7 +2502,14 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
 
         # --- Pass 2: detailed clip extraction on the shortlist ---
-        min_clips, max_clips = clip_count_targets(len(shortlist))
+        # One call for a shortlist one call can read, as always. A long
+        # source's longer shortlist goes in groups, each a stretch of the
+        # video asked for its own share: the count follows the length
+        # (clip_selection.detail_plan).
+        groups, bands, min_clips, max_clips = detail_plan(shortlist)
+        if len(groups) > 1:
+            print(f"   A long source: {len(groups)} detail calls, "
+                  f"{min_clips}-{max_clips} clips in all.")
 
         def _detail_prompt_for(lo, hi):
             # A split batch keeps the full clip-count band: a short list can
@@ -2208,9 +2522,13 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
             return build
 
-        shorts = _run_stage_split(client, model_name, shortlist,
-                                  _detail_prompt_for(min_clips, max_clips),
-                                  gemini_worker.DetailResponse, "shorts", costs, "detail")
+        shorts = []
+        for group, (lo, hi) in zip(groups, bands):
+            shorts.extend(_run_stage_split(client, model_name, group,
+                                           _detail_prompt_for(lo, hi),
+                                           gemini_worker.DetailResponse, "shorts", costs, "detail"))
+        if len(groups) > 1:
+            shorts.sort(key=lambda s: float(s.get("start") or 0))
 
         # The floor lived only in the prompt, and a prompt is not a contract:
         # the model regularly returned half of it and the job shipped that.
@@ -2465,7 +2783,10 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
                   + (f" (only the first {covered / 60:.0f} of "
                      f"{video_duration / 60:.0f} min; VISION_MAX_SEGMENTS)"
                      if covered < float(video_duration) - 1 else ""))
-        per_min = max(1, math.ceil(v_min_clips / len(segments)))
+        # A long silent source gives clips in proportion to its length too
+        # (clip_selection.vision_targets); a short one keeps the classic band.
+        per_min, per_max, v_min_clips, v_max_clips = vision_targets(
+            covered, len(segments), v_min_clips, v_max_clips)
         clean, costs = [], []
         tmp_dir = os.path.join(os.path.dirname(os.path.abspath(video_path)),
                                f".vision_{uuid.uuid4().hex[:8]}")
@@ -2477,7 +2798,7 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
                     _vision_proxy(video_path, s0, s1, proxy)
                     shorts, cost = _visual_pass(
                         client, model_name, proxy, round(s1 - s0, 3), language,
-                        per_min, v_max_clips, v_min_secs, v_max_secs,
+                        per_min, per_max, v_min_secs, v_max_secs,
                         hint=_viewer_hint(viewer_clips, s0, s1 - s0))
                 except gemini_worker.GeminiBlockedError:
                     raise
@@ -2662,7 +2983,7 @@ if __name__ == '__main__':
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
                      and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
         input_video, video_title = download_youtube_video(
-            args.url, output_dir, on_audio=_on_audio if use_early else None)
+            args.url, output_dir, on_audio=_on_audio if use_early else None, use_cache=True)
     else:
         input_video = args.input
         video_title = os.path.splitext(os.path.basename(input_video))[0]
@@ -2708,6 +3029,11 @@ if __name__ == '__main__':
         # cut to what was reserved). A remote worker takes it from here
         # (remote_worker.py); the marker is consumed by app.py.
         print(f"SOURCE_READY {input_video}", flush=True)
+        _mode = os.environ.get("PREPARE_TRANSCRIPT", "").strip().lower()
+        if _mode in ("1", "cache") and not args.skip_analysis and not args.transcript:
+            prepare_transcript(input_video, output_dir, args.url, _mode)
+        if os.environ.get("PREPARE_SCENES", "").strip() == "1" and not args.skip_analysis:
+            prepare_scenes(input_video, output_dir)
         sys.exit(0)
 
     # Layout choice is per SOURCE video, not per clip: one upload and one call
@@ -2769,6 +3095,10 @@ if __name__ == '__main__':
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = frame_count / fps
         cap.release()
+        # Scene probabilities the GPU host prepared for this source (a remote
+        # worker's job): the clips map them instead of running TransNetV2.
+        import scene_detection
+        scene_detection.use_prepared(output_dir, input_video, duration)
 
         # 3. Transcribe — unless the video has no audio, in which case fall back
         # to Gemini vision (picks clips from the imagery instead of the speech).
@@ -2805,12 +3135,24 @@ if __name__ == '__main__':
             if transcript is not None:
                 print(f"♻️ Reusing the transcript from the interrupted run "
                       f"({len(transcript['segments'])} segments) — skipping transcription.")
+        # Another job already transcribed this very source (download cache).
+        transcript_from_cache = False
+        if transcript is None and args.url:
+            import source_cache
+            transcript = source_cache.fetch_transcript(args.url, duration)
+            if transcript is not None:
+                transcript_from_cache = True
+                save_transcript_checkpoint(output_dir, transcript, input_video, duration)
         if transcript is None:
             try:
                 transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
             except NoAudioError as e:
                 print(f"🔇 {e} — switching to visual analysis.")
+        if transcript is not None and args.url and not transcript_from_cache:
+            # Kept only when this job's source is the cached file, uncut.
+            import source_cache
+            source_cache.store_transcript(args.url, duration, transcript, input_video)
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
@@ -2859,6 +3201,11 @@ if __name__ == '__main__':
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
             def _process_one_clip(i, clip):
+                if clip.get('pro_before'):
+                    # A retry of a clip whose first attempt got as far as pro
+                    # mode: start again from the range Gemini picked.
+                    import pro_mode
+                    clip.update(pro_mode.restore(clip))
                 start = clip['start']
                 end = clip['end']
                 print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
@@ -2871,6 +3218,8 @@ if __name__ == '__main__':
                 try:
                     # ffmpeg cut — re-encoding for precision on strict seconds
                     cut_clip(input_video, clip_temp_path, start, end, i + 1)
+                    import scene_detection
+                    scene_detection.register_clip(clip_temp_path, start)
 
                     # Layer order: the canonical reframe stays CLEAN, the hook
                     # is a derived hooked_ file, captions go last on top of
@@ -2895,15 +3244,26 @@ if __name__ == '__main__':
                     if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
                     captioned = None
+                    # Pro mode replaces the file the hook and the captions go
+                    # on, and the timeline they are laid on (its cuts); the
+                    # canonical reframe stays, it is the clip's normal mode.
+                    base_path, words, w_start, w_end = clip_final_path, transcript, start, end
+                    pro = pro_clip(clip_final_path, clip, transcript) if success else None
+                    cap_style = None
+                    if pro:
+                        deliver_path = base_path = pro[0]
+                        words, w_start, w_end = pro[1:]
+                        cap_style = clip.get('caption_style')
                     split_ranges = _layouts.split_ranges(clip['layout_ranges'])
                     if success and os.environ.get("AUTO_HOOK") == "1":
                         # Captions ride the hook's ffmpeg (one decode, two
                         # outputs) when both are on; see auto_hook_clip.
                         plan = None
                         if (clip.get('viral_hook_text') or '').strip():
-                            plan = auto_caption_clip(clip_final_path, transcript, start, end,
-                                                     split_ranges=split_ranges, plan_only=True)
-                        hooked = auto_hook_clip(clip_final_path, clip, captions=plan,
+                            plan = auto_caption_clip(base_path, words, w_start, w_end,
+                                                     split_ranges=split_ranges, plan_only=True,
+                                                     style=cap_style)
+                        hooked = auto_hook_clip(base_path, clip, captions=plan,
                                                 mark=os.environ.get("WATERMARK") == "1")
                         if hooked:
                             deliver_path, clip['auto_hook'] = hooked
@@ -2911,9 +3271,10 @@ if __name__ == '__main__':
                     if success:
                         if not captioned:
                             captioned = auto_caption_clip(
-                                deliver_path, transcript, start, end,
+                                deliver_path, words, w_start, w_end,
                                 split_ranges=split_ranges,
-                                mark=os.environ.get("WATERMARK") == "1")
+                                mark=os.environ.get("WATERMARK") == "1",
+                                style=cap_style)
                         served = captioned or deliver_path
                         if os.environ.get("WATERMARK") == "1":
                             served = mark_delivery(served)
@@ -2974,7 +3335,8 @@ if __name__ == '__main__':
 
             # Persist per-clip render results added by the workers (auto_hook)
             # so the editor can see what is already burned into each clip.
-            if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
+            if any('auto_hook' in c or 'hook_grounding' in c or 'pro_suggested' in c
+                   for c in shorts):
                 # Atomic: the dashboard is already reading this file for the
                 # clips announced above (CLIP_READY).
                 write_json_atomic(metadata_file, clips_data, indent=2)
