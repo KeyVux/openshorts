@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp, Music } from 'lucide-react';
+import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import { platformOptions as buildPlatformOptions, defaultPlatformFlags, flagsFromList } from '../lib/socialPlatforms';
 import { track } from '../lib/analytics';
 import SubtitleModal from './SubtitleModal';
-import MediaModal from './MediaModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 import Modal from './ui/Modal';
@@ -79,9 +78,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     }, [clip.why]);
     const [showDescModal, setShowDescModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
-    const [showMediaModal, setShowMediaModal] = useState(false);
-    const [isMediaRendering, setIsMediaRendering] = useState(false);
-    const [mediaStatus, setMediaStatus] = useState('');
     const [showWatermarkModal, setShowWatermarkModal] = useState(false);
     const { plan } = useAuth();
     const videoRef = React.useRef(null);
@@ -248,34 +244,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // the layers persisted in its project state, so the next edit composes over
     // them instead of silently dropping previous browser-side work.
     const [activeLayers, setActiveLayers] = useState(initialState?.active_layers || { subtitles: null, hook: null, effects: null });
-
-    const handleMediaRender = async (body) => {
-        setIsMediaRendering(true);
-        setMediaStatus('Rendering music & images in background…');
-        try {
-            const response = await apiFetch('/api/clip/media', { method: 'POST', body });
-            const result = await response.json();
-            if (!response.ok) throw new Error(result.detail || 'Could not apply media');
-            const url = getApiUrl(result.new_video_url);
-            setServerVideoFile(result.new_video_url.split('/').pop());
-            setCurrentVideoUrl(url);
-            setDurableSrc(null);
-            // Browser-only captions have not reached the server input. Put
-            // them over the completed images, preserving their current look.
-            if (activeLayers.subtitles || activeLayers.hook || activeLayers.effects) {
-                setCurrentVideoUrl(await renderInBrowser({
-                    videoUrl: url, durationInSeconds: clipDuration,
-                    subtitles: activeLayers.subtitles,
-                    hook: activeLayers.hook, effects: activeLayers.effects,
-                }));
-            }
-            setMediaStatus('Music & images ready.');
-        } catch (error) {
-            setMediaStatus(`Media render failed: ${error.message}`);
-        } finally {
-            setIsMediaRendering(false);
-        }
-    };
 
     // Report edit state upward (debounced sync to the project record). Skip the
     // mount run: only user-driven changes are worth persisting.
@@ -979,8 +947,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 )}
 
                 {/* Actions Footer */}
-                {mediaStatus && <p role="status" aria-live="polite" className="mt-3 text-xs text-muted">{mediaStatus}</p>}
-                <fieldset disabled={isMediaRendering} className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2 mt-auto pt-4 border-t border-rule">
+                <fieldset className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2 mt-auto pt-4 border-t border-rule">
                     {onEditClip && (
                         <button
                             onClick={() => onEditClip(index)}
@@ -990,16 +957,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                             edit clip
                         </button>
                     )}
-
-                    <button
-                        onClick={() => setShowMediaModal(true)}
-                        className={QUIET_BTN}
-                        title="Music, watermark & lower-third image"
-                        aria-label="Music, watermark and lower-third image"
-                    >
-                        <Music size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
-                        {isMediaRendering ? 'rendering…' : 'music & images'}
-                    </button>
 
                     {onReframeClip && (
                         <button
@@ -1072,8 +1029,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 </fieldset>
             </div>
 
-            {showMediaModal && <MediaModal jobId={jobId} index={index} filename={serverVideoFile}
-                onClose={() => setShowMediaModal(false)} onRender={handleMediaRender} />}
+
             {/* Descriptions Modal */}
             <Modal
                 isOpen={showDescModal}

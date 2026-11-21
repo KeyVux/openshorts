@@ -365,6 +365,9 @@ function App() {
   const [autopilotOn, setAutopilotOn] = useState(false);
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [jobId, setJobId] = useState(null);
+  const [mediaSettings, setMediaSettings] = useState(null);
+  const runMediaSettings = useRef(null);
+  const mediaBatchRunning = useRef(false);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
   // Best clips first. The backend hands them back in transcript order, which
@@ -857,13 +860,15 @@ function App() {
     let failures = 0;
     if ((status === 'processing' || status === 'completed') && jobId) {
       interval = setInterval(async () => {
+        if (mediaBatchRunning.current) return;
         try {
           const data = await pollJob(jobId);
+          if (mediaBatchRunning.current) return;
           failures = 0;
           console.log("Job status:", data);
 
           // Update results if available (real-time)
-          if (data.result) {
+          if (data.result && !runMediaSettings.current) {
             setResults(data.result);
           }
 
@@ -871,6 +876,41 @@ function App() {
           setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
 
           if (data.status === 'completed') {
+            clearInterval(interval);
+            const settings = runMediaSettings.current;
+            if (settings && data.result?.clips?.length) {
+              mediaBatchRunning.current = true;
+              try {
+                const clips = [...data.result.clips];
+                for (let index = 0; index < clips.length; index++) {
+                  setLogs(prev => [...prev, `Applying music & images to clip ${index + 1} of ${clips.length}…`]);
+                  const body = new FormData();
+                  Object.entries({ job_id: jobId, clip_index: index,
+                    input_filename: clips[index].video_url.split('/').pop(),
+                    music_volume: settings.musicVolume / 100,
+                    original_volume: settings.originalVolume / 100,
+                    pixabay_key: settings.key, blurred_vertical: settings.blurredVertical,
+                  }).forEach(([name, value]) => body.append(name, value));
+                  for (const [kind, mode] of Object.entries(settings.modes)) {
+                    body.append(`${kind}_mode`, mode);
+                    if (mode === 'upload' && settings.files[kind]) body.append(kind, settings.files[kind]);
+                    if (settings.queries[kind]) body.append(`${kind}_query`, settings.queries[kind]);
+                  }
+                  const response = await apiFetch('/api/clip/media', { method: 'POST', body });
+                  const result = await response.json();
+                  if (!response.ok) throw new Error(`Clip ${index + 1}: ${result.detail || 'Could not apply media'}`);
+                  clips[index] = { ...clips[index], video_url: result.new_video_url };
+                }
+                setResults({ ...data.result, clips });
+              } catch (error) {
+                setJobError(`Music & images render failed: ${error.message}`);
+                setStatus('error');
+                refreshMe();
+                return;
+              } finally {
+                mediaBatchRunning.current = false;
+              }
+            } else if (data.result) setResults(data.result);
             setQueueInfo(null);
             setStatus('complete');
             clearInterval(interval);
@@ -1173,6 +1213,10 @@ function App() {
     }
     // Past every gate, so this request is really running: nothing left to resume.
     clearPendingJob();
+    runMediaSettings.current = mediaSettings && (
+      Object.values(mediaSettings.modes).some(mode => mode !== 'none') ||
+      mediaSettings.blurredVertical || mediaSettings.originalVolume !== 100
+    ) ? mediaSettings : null;
     setStatus('processing');
     setJobError('');
     setLogs(["Starting process..."]);
@@ -2207,7 +2251,8 @@ function App() {
                   )}
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'}
+                  mediaSettings={mediaSettings} onMediaSettingsChange={setMediaSettings} />
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-xs sm:text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

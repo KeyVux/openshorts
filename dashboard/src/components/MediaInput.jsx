@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
+import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown, Music } from 'lucide-react';
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
+import MediaModal from './MediaModal';
 import SourceCost from './SourceCost';
 
 const SUPPORTED_PLATFORMS = [
@@ -30,7 +31,7 @@ const readVideoDuration = (file) => new Promise((resolve) => {
     } catch { resolve(null); }
 });
 
-export default function MediaInput({ onProcess, isProcessing }) {
+export default function MediaInput({ onProcess, isProcessing, mediaSettings, onMediaSettingsChange }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     // File upload is the primary path; the link is secondary.
     const [mode, setMode] = useState('file'); // 'file' | 'url'
@@ -45,6 +46,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [showInfo, setShowInfo] = useState(false);
     // Advanced generation controls — empty string means "let the AI decide",
     // which keeps the default pipeline behavior untouched.
+    const [showMediaModal, setShowMediaModal] = useState(false);
     const [showAdvanced, setShowAdvanced] = useState(false);
     const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
@@ -311,7 +313,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         className="flex items-center gap-1.5 text-xs text-muted hover:text-ink2 lowercase transition-colors"
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
-                        advanced options
+                        advanced setup
                         {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
                             <span className="text-brass">·</span>
                         )}
@@ -320,6 +322,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         /* Stacked on a phone: three number fields side by side leaves
                            ~100px each, which crushes both label and value. */
                         <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-2 animate-fade">
+                            <div className="col-span-1 sm:col-span-3">
+                                <button type="button" className="btn-ghost text-xs" onClick={() => setShowMediaModal(true)}>
+                                    <Music size={16} /> music &amp; images
+                                </button>
+                                <p className="mt-1 text-xs text-muted">Applies to all videos rendered in this working session.</p>
+                            </div>
                             <div>
                                 <p className="eyebrow mb-1.5">clips to aim for</p>
                                 <input
@@ -434,6 +442,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     )}
                 </button>
             </form>
+            {showMediaModal && <MediaModal settings={mediaSettings} onSave={onMediaSettingsChange}
+                onClose={() => setShowMediaModal(false)} />}
         </div>
     );
 }
