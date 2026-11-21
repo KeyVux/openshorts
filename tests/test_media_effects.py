@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from media_effects import probe, render, resolve_source, foreground_height
+from media_effects import probe, render, resolve_source, foreground_height, validate_layout
 
 pytestmark = pytest.mark.skipif(not shutil.which('ffmpeg'), reason='FFmpeg required')
 
@@ -63,3 +63,30 @@ def test_original_audio_volume_only(tmp_path):
     result = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(output), '-map', '0:a',
                              '-f', 's16le', '-'], capture_output=True, check=True)
     assert result.stdout and set(result.stdout) == {0}
+
+
+@pytest.mark.parametrize('value', [
+    {'watermark': {'x': float('nan'), 'y': 0, 'width': .2}},
+    {'picture': {'x': 0, 'y': -1, 'width': .2}},
+    {'picture': {'x': 0, 'y': 0, 'width': 0}},
+])
+def test_invalid_overlay_coordinates(value):
+    with pytest.raises(ValueError):
+        validate_layout(value)
+
+
+def test_image_position_and_scale_match_render(tmp_path):
+    source, image, output = [tmp_path / name for name in ('source.mp4', 'logo.png', 'output.mp4')]
+    generate('-f', 'lavfi', '-i', 'color=blue:s=160x120:d=0.3', '-c:v', 'libx264', source)
+    generate('-f', 'lavfi', '-i', 'color=red:s=80x40', '-frames:v', '1', image)
+    render(str(source), str(output), watermark=str(image),
+           layout={'watermark': {'x': .5, 'y': .25, 'width': .25}})
+    frame = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(output), '-frames:v', '1',
+                            '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], capture_output=True, check=True).stdout
+    def pixel(x, y):
+        offset = (y * 160 + x) * 3
+        return frame[offset:offset + 3]
+    assert pixel(90, 40)[0] > 200  # inside the resized 40 x 20 logo
+    assert pixel(70, 40)[2] > 200  # left of the logo
+    assert pixel(125, 40)[2] > 200  # right of the logo
+    assert pixel(90, 55)[2] > 200  # below the logo

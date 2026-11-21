@@ -7648,6 +7648,42 @@ _rerender_locks: Dict[str, asyncio.Lock] = {}
 _scenes_locks: Dict[str, asyncio.Lock] = {}
 
 
+@app.get("/api/clip/media-state")
+async def clip_media_state(request: Request, job_id: str, input_filename: str):
+    import base64
+    import media_effects
+    await require_managed_entitlement(request)
+    await _ensure_job_files(job_id, request)
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, 'Job not found')
+    await _assert_job_owner(request, job)
+    directory = os.path.join(OUTPUT_DIR, job_id)
+    try:
+        source = media_effects.resolve_source(directory, input_filename)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, 'Video unavailable') from exc
+    recipe_path = source + '.media.json'
+    if not os.path.isfile(recipe_path):
+        return {'layout': {}, 'images': {}, 'editable': False}
+    with open(recipe_path) as handle:
+        recipe = json.load(handle)
+    images = {}
+    for kind in ('watermark', 'picture'):
+        asset = recipe.get('assets', {}).get(kind)
+        if asset and os.path.isfile(asset):
+            from PIL import Image
+            import io
+            with Image.open(asset) as image:
+                image.thumbnail((1024, 1024))
+                buffer = io.BytesIO()
+                image.convert('RGBA').save(buffer, format='PNG')
+            images[kind] = 'data:image/png;base64,' + base64.b64encode(buffer.getvalue()).decode('ascii')
+    return {'layout': recipe.get('layout', {}), 'images': images, 'editable': True,
+            'blurred_vertical': recipe.get('blurred_vertical', False),
+            'source_url': f"/videos/{job_id}/{os.path.basename(recipe['source'])}"}
+
+
 @app.post("/api/clip/media")
 async def add_clip_media(
     request: Request, job_id: str = Form(...), clip_index: int = Form(...),
@@ -7657,6 +7693,7 @@ async def add_clip_media(
     watermark_query: str = Form(''), picture_query: str = Form(''),
     pixabay_key: str = Form(''), music: Optional[UploadFile] = File(None),
     blurred_vertical: bool = Form(False),
+    image_layout: str = Form('{}'), images_only: bool = Form(False),
     watermark: Optional[UploadFile] = File(None), picture: Optional[UploadFile] = File(None),
 ):
     import tempfile
@@ -7669,6 +7706,10 @@ async def add_clip_media(
     await _assert_job_owner(request, job)
     if not (0 <= music_volume <= 2 and 0 <= original_volume <= 2):
         raise HTTPException(400, 'Volumes must be between 0 and 2')
+    try:
+        layout = media_effects.validate_layout(json.loads(image_layout))
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(400, 'Invalid image layout') from exc
     if input_filename != os.path.basename(input_filename) or not input_filename.endswith('.mp4'):
         raise HTTPException(400, 'Invalid input filename')
     async with _rerender_locks.setdefault(job_id, asyncio.Lock()):
@@ -7691,9 +7732,18 @@ async def add_clip_media(
             raise HTTPException(400, str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(404, 'This video file is no longer available. Reload the job and try again.') from exc
+        recipe = {}
+        if os.path.isfile(source + '.media.json'):
+            with open(source + '.media.json') as handle:
+                recipe = json.load(handle)
+            source = media_effects.resolve_source(directory, os.path.basename(recipe['source']))
+            if images_only:
+                music_volume = recipe.get('music_volume', .2)
+                original_volume = recipe.get('original_volume', 1)
+                blurred_vertical = recipe.get('blurred_vertical', False)
         clean_name = await asyncio.to_thread(_strip_burned_captions, directory, input_filename)
         restore_captions = bool(re.search(r'(^|_)subtitled_\d+_', input_filename))
-        if restore_captions:
+        if restore_captions and not recipe:
             if clean_name == input_filename:
                 raise HTTPException(400, 'The video without subtitles is unavailable. Restore the source before placing images behind subtitles.')
             source = media_effects.resolve_source(directory, clean_name)
@@ -7702,14 +7752,23 @@ async def add_clip_media(
         try:
             with tempfile.TemporaryDirectory() as temp:
                 assets = {}
+                if images_only and recipe.get('assets', {}).get('music'):
+                    assets['music'] = recipe['assets']['music']
                 for kind, mode, upload, query in [
                     ('music', music_mode, music, ''),
                     ('watermark', watermark_mode, watermark, watermark_query),
                     ('picture', picture_mode, picture, picture_query),
                 ]:
-                    if mode not in ('none', 'upload', 'api'):
+                    if mode not in ('none', 'upload', 'api', 'keep'):
                         raise ValueError('Invalid asset source')
+                    if kind == 'music' and images_only:
+                        continue
                     if mode == 'none':
+                        continue
+                    if mode == 'keep':
+                        if not recipe.get('assets', {}).get(kind):
+                            raise ValueError(f'No retained {kind} image')
+                        assets[kind] = recipe['assets'][kind]
                         continue
                     path = os.path.join(temp, kind + ('.audio' if kind == 'music' else '.png'))
                     if mode == 'upload':
@@ -7726,9 +7785,35 @@ async def add_clip_media(
                         url = await asyncio.to_thread(media_effects.random_asset, kind, query, pixabay_key)
                         await asyncio.to_thread(media_effects.download, url, path)
                     assets[kind] = path
+                # Keep originals outside the public media directory for future edits.
+                import shutil
+                asset_dir = os.path.join(directory, '.media_assets')
+                os.makedirs(asset_dir, exist_ok=True)
+                for kind, asset in list(assets.items()):
+                    if os.path.dirname(asset) == temp:
+                        retained = os.path.join(asset_dir, uuid.uuid4().hex + os.path.splitext(asset)[1])
+                        shutil.copyfile(asset, retained)
+                        assets[kind] = retained
+                # Record the exact legacy default positions too, so the editor
+                # preview starts at the size used by the initial session render.
+                if any(kind in assets and kind not in layout for kind in ('watermark', 'picture')):
+                    source_info = await asyncio.to_thread(media_effects.probe, source)
+                    frame = next(s for s in source_info['streams'] if s['codec_type'] == 'video')
+                    fw, fh = (1080, 1920) if blurred_vertical else (int(frame['width']), int(frame['height']))
+                    for kind, ratio in (('watermark', .18), ('picture', .65)):
+                        if kind not in assets or kind in layout:
+                            continue
+                        asset_info = await asyncio.to_thread(media_effects.probe, assets[kind])
+                        image = next(s for s in asset_info['streams'] if s['codec_type'] == 'video')
+                        scale = min((int(fw * ratio) // 2 * 2) / int(image['width']),
+                                    (int(fh * .28) // 2 * 2) / int(image['height']))
+                        iw = int(image['width']) * scale
+                        layout[kind] = {'width': iw / fw,
+                                        'x': (fw - iw - 24) / fw if kind == 'watermark' else (fw - iw) / (2 * fw),
+                                        'y': 24 / fh if kind == 'watermark' else 2 / 3}
                 await asyncio.to_thread(media_effects.render, source, output, **assets,
                                         music_volume=music_volume, original_volume=original_volume,
-                                        blurred_vertical=blurred_vertical)
+                                        blurred_vertical=blurred_vertical, layout=layout)
             # Compose images first, then captions at the final frame size.
             # Starting from the uncaptioned input avoids duplicate text and
             # keeps captions sharp when the vertical framing changes.
@@ -7738,6 +7823,11 @@ async def add_clip_media(
                     raise ValueError('Could not restore subtitles over the images')
                 output_name = os.path.basename(captioned)
             output_name = await _deliver(request, job_id, output_name)
+            write_json_atomic(os.path.join(directory, output_name) + '.media.json', {
+                'source': source, 'assets': assets, 'layout': layout,
+                'music_volume': music_volume, 'original_volume': original_volume,
+                'blurred_vertical': blurred_vertical,
+            }, indent=2)
         except Exception as exc:
             if os.path.exists(output):
                 os.remove(output)

@@ -4,6 +4,7 @@ import os
 import random
 import subprocess
 import time
+import math
 from urllib.parse import urlparse
 
 import requests
@@ -84,7 +85,27 @@ def foreground_height(width, height):
     return int((1920 + fitted) / 2) // 2 * 2
 
 
-def render(source, output, music=None, watermark=None, picture=None, music_volume=.2, original_volume=1, blurred_vertical=False):
+def validate_layout(value):
+    if not isinstance(value, dict):
+        raise ValueError('Invalid image layout')
+    result = {}
+    for kind in ('watermark', 'picture'):
+        if kind not in value:
+            continue
+        item = value[kind]
+        if not isinstance(item, dict):
+            raise ValueError('Invalid image layout')
+        result[kind] = {}
+        for name in ('x', 'y', 'width'):
+            number = float(item[name])
+            if not math.isfinite(number) or not 0 <= number <= 1 or (name == 'width' and number < .02):
+                raise ValueError('Image positions and sizes must be within the video')
+            result[kind][name] = number
+    return result
+
+
+def render(source, output, music=None, watermark=None, picture=None, music_volume=.2, original_volume=1, blurred_vertical=False, layout=None):
+    layout = validate_layout(layout or {})
     info = probe(source)
     video = next(s for s in info['streams'] if s['codec_type'] == 'video')
     width, height = int(video['width']), int(video['height'])
@@ -99,14 +120,21 @@ def render(source, output, music=None, watermark=None, picture=None, music_volum
                     f'[fg]scale=1080:{front_height}:force_original_aspect_ratio=increase,crop=1080:{front_height},setsar=1[front]',
                     '[blur][front]overlay=(W-w)/2:(H-h)/2,setsar=1[vertical]']
         current = 'vertical'
-    for asset, ratio, position in [(watermark, .18, 'W-w-24:24'), (picture, .65, '(W-w)/2:2*H/3')]:
+    for kind, asset, ratio, position in [('watermark', watermark, .18, 'W-w-24:24'), ('picture', picture, .65, '(W-w)/2:2*H/3')]:
         if not asset:
             continue
         streams = probe(asset)['streams']
         if not any(s['codec_type'] == 'video' for s in streams):
             raise ValueError('Overlay must be an image')
         command += ['-loop', '1', '-i', asset]
-        filters += [f'[{idx}:v]scale={int(width*ratio)//2*2}:{int(height*.28)//2*2}:force_original_aspect_ratio=decrease,format=rgba[img{idx}]',
+        placement = layout.get(kind)
+        if placement:
+            size = max(2, int(width * placement['width']))
+            scaling = f'scale={size}:-1'
+            position = f"{width * placement['x']}:{height * placement['y']}"
+        else:
+            scaling = f'scale={int(width*ratio)//2*2}:{int(height*.28)//2*2}:force_original_aspect_ratio=decrease'
+        filters += [f'[{idx}:v]{scaling},setsar=1,format=rgba[img{idx}]',
                     f'[{current}][img{idx}]overlay={position}:shortest=1[v{idx}]']
         current = f'v{idx}'
         idx += 1

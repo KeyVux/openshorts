@@ -11,6 +11,7 @@ import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
 import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
 import TikTokDraftNotice from './TikTokDraftNotice';
+import ImageOverlayModal from './ImageOverlayModal';
 import { useAuth } from '../contexts/AuthContext';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
@@ -79,6 +80,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     const [showDescModal, setShowDescModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const [showWatermarkModal, setShowWatermarkModal] = useState(false);
+    const [showImageEditor, setShowImageEditor] = useState(false);
     const { plan } = useAuth();
     const videoRef = React.useRef(null);
     // Pristine base clip (no burned subtitles/hook), stable regardless of how
@@ -1061,6 +1063,9 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
 
                 {/* Actions Footer */}
                 <fieldset className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2 mt-auto pt-4 border-t border-rule">
+                    <button type="button" className={QUIET_BTN} onClick={() => setShowImageEditor(true)}>
+                        <Crosshair size={16} /> watermark & picture
+                    </button>
                     {onEditClip && (
                         <button
                             onClick={() => onEditClip(index)}
@@ -1358,6 +1363,13 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 hasApiKey={!!elevenLabsKey}
             />
 
+            {showImageEditor && <ImageOverlayModal jobId={jobId} index={index} filename={serverVideoFile}
+                videoUrl={currentVideoUrl} onClose={() => setShowImageEditor(false)} onApplied={data => {
+                    setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                    setServerVideoFile(data.new_video_url.split('/').pop());
+                    setDurableSrc(null);
+                    setVideoErrored(false);
+                }} />}
             {showWatermarkModal && (
                 <WatermarkModal
                     source="download"
