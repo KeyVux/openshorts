@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { selectComposition, renderMedia } from "@remotion/renderer";
+import { selectComposition, renderMedia, openBrowser } from "@remotion/renderer";
+import { limits } from "./render-queue.js";
 import { getBundleLocation } from "./bundle.js";
 import { renderJobs } from "./server.js";
 
@@ -33,6 +34,7 @@ export async function executeRender(params: RenderParams): Promise<void> {
     return;
   }
 
+  let browser: Awaited<ReturnType<typeof openBrowser>> | undefined;
   try {
     job.status = "rendering";
     job.progress = 0;
@@ -42,12 +44,14 @@ export async function executeRender(params: RenderParams): Promise<void> {
     );
 
     const bundleLocation = getBundleLocation();
+    browser = await openBrowser("chrome");
 
     // Select the composition with the provided input props
     const composition = await selectComposition({
       serveUrl: bundleLocation,
       id: "ShortVideo",
       inputProps: props,
+      puppeteerInstance: browser,
     });
 
     // Determine output directory and file path
@@ -58,16 +62,19 @@ export async function executeRender(params: RenderParams): Promise<void> {
     const jobOutputDir = path.join(outputDir, jobId);
     fs.mkdirSync(jobOutputDir, { recursive: true });
 
-    const timestamp = Date.now();
-    const outputFileName = `remotion_${clipIndex}_${timestamp}.mp4`;
+    const outputFileName = `remotion_${clipIndex}_${renderId}.mp4`;
     const outputLocation = path.join(jobOutputDir, outputFileName);
 
     console.log(`[render-worker] Output: ${outputLocation}`);
 
     // Render the video
+    let lastLoggedPercent = -1;
     await renderMedia({
       composition,
       serveUrl: bundleLocation,
+      inputProps: props,
+      puppeteerInstance: browser,
+      concurrency: limits.frames,
       codec: "h264",
       crf: 22,
       outputLocation,
@@ -75,7 +82,8 @@ export async function executeRender(params: RenderParams): Promise<void> {
         const percent = Math.round(progress * 100);
         job.progress = percent;
 
-        if (percent % 10 === 0) {
+        if (percent % 10 === 0 && percent !== lastLoggedPercent) {
+          lastLoggedPercent = percent;
           console.log(`[render-worker] ${renderId} progress: ${percent}%`);
         }
       },
@@ -92,5 +100,9 @@ export async function executeRender(params: RenderParams): Promise<void> {
     job.error = err instanceof Error ? err.message : String(err);
 
     console.error(`[render-worker] Render ${renderId} failed:`, err);
+  } finally {
+    await browser?.close({ silent: true }).catch((err) => {
+      console.error(`[render-worker] Browser cleanup failed for ${renderId}:`, err);
+    });
   }
 }

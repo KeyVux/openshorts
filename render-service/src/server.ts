@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import { initBundle } from "./bundle.js";
 import { executeRender } from "./render-worker.js";
+import { renderQueue, limits } from "./render-queue.js";
 
 // --- Render status types ---
 
@@ -93,8 +94,8 @@ app.post("/render", (req, res) => {
     console.log(`[render] Resolved video URL: ${props.videoUrl} -> ${resolvedVideoUrl}`);
   }
 
-  // Fire and forget - render runs in background
-  executeRender({
+  // Keep pending jobs queued until a render slot is available.
+  renderQueue.run(() => executeRender({
     renderId,
     jobId,
     clipIndex,
@@ -108,7 +109,7 @@ app.post("/render", (req, res) => {
       hook: props.hook ?? null,
       effects: props.effects ?? null,
     },
-  }).catch((err) => {
+  })).catch((err) => {
     console.error(`[render] Unhandled error for ${renderId}:`, err);
     const existingJob = renderJobs.get(renderId);
     if (existingJob) {
@@ -152,6 +153,7 @@ app.get("/render/:renderId", (req, res) => {
 // --- Start server ---
 
 async function main() {
+  console.log(`[render-service] Render slots=${limits.jobs}, frames per render=${limits.frames}`);
   console.log("[render-service] Initializing Remotion bundle...");
   await initBundle();
   console.log("[render-service] Bundle ready.");

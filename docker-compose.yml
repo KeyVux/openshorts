@@ -37,6 +37,8 @@ services:
       - REMOTION_BUNDLE_PATH=/app/remotion
       - OUTPUT_DIR=/output
       - PORT=3100
+        - RENDER_CONCURRENT_JOBS=${RENDER_CONCURRENT_JOBS:-2}
+        - RENDER_FRAME_CONCURRENCY=${RENDER_FRAME_CONCURRENCY:-}
     restart: unless-stopped
     depends_on:
       - backend
